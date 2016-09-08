@@ -21,7 +21,20 @@
   *)
 #import "conduit_config.mlh"
 
-module Flow: V1_LWT.FLOW
+module Flow : sig
+  include V1_LWT.FLOW
+  type dest = [
+    | `TCP of Ipaddr.t * int
+    | `TLS of dest
+#if HAVE_VCHAN
+    | `Vchan of [
+        | `Direct of int * Vchan.Port.t                   (** domain id, port *)
+        | `Domain_socket of string * Vchan.Port.t (** Vchan Xen domain socket *)
+      ]
+#endif
+    ]
+  val get_dest : flow -> dest
+end
 (** Dynamic flows. *)
 
 type callback = Flow.flow -> unit Lwt.t

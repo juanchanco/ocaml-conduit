@@ -36,8 +36,20 @@ module Flow = struct
   type 'a io = 'a Lwt.t
   type error = unit -> string
   type buffer = Cstruct.t
-  type flow = Flow: (module V1_LWT.FLOW with type flow = 'a) * 'a -> flow
-  let create m t = Flow (m, t)
+  type dest = [
+    | `TCP of Ipaddr.t * int
+    | `TLS of dest
+#if HAVE_VCHAN
+    | `Vchan of [
+        | `Direct of int * Vchan.Port.t                   (** domain id, port *)
+        | `Domain_socket of string * Vchan.Port.t (** Vchan Xen domain socket *)
+      ]
+#endif
+    ]
+  type flow = Flow:
+    (module V1_LWT.FLOW with type flow = 'a) * 'a * ('a -> dest)
+    -> flow
+  let create m t d = Flow (m, t, d)
 
   let wrap_errors (type e) (module F : V1_LWT.FLOW with type error = e) v =
     v >>= function
@@ -45,10 +57,11 @@ module Flow = struct
     | `Ok _ | `Eof as other -> Lwt.return other
 
   let error_message fn = fn ()
-  let read (Flow ((module F), flow)) = wrap_errors (module F) (F.read flow)
-  let write (Flow ((module F), flow)) b = wrap_errors (module F) (F.write flow b)
-  let writev (Flow ((module F), flow)) b = wrap_errors (module F) (F.writev flow b)
-  let close (Flow ((module F), flow)) = F.close flow
+  let read (Flow ((module F), flow, d)) = wrap_errors (module F) (F.read flow)
+  let write (Flow ((module F), flow, d)) b = wrap_errors (module F) (F.write flow b)
+  let writev (Flow ((module F), flow, d)) b = wrap_errors (module F) (F.writev flow b)
+  let close (Flow ((module F), flow, d)) = F.close flow
+  let get_dest (Flow ((module F), flow, d)) = d flow
 end
 
 type callback = Flow.flow -> unit Lwt.t
@@ -184,19 +197,25 @@ module TCP (S: V1_LWT.STACKV4) = struct
   let err_tcp e = fail "TCP connection failed: %s" (S.TCPV4.error_message e)
 
   let connect t (`TCP (ip, port): client) =
+    let get_dest _ = `TCP (ip, port) in
     match Ipaddr.to_v4 ip with
     | None    -> err_ipv6 "connect"
     | Some ip ->
       S.TCPV4.create_connection (S.tcpv4 t) (ip, port) >>= function
       | `Error e -> err_tcp e
       | `Ok flow ->
-      let flow = Flow.create (module S.TCPV4) flow in
+      let flow = Flow.create (module S.TCPV4) flow get_dest in
       Lwt.return flow
 
   let listen t (`TCP port: server) fn =
+    let get_dest t =
+      let addr,port = S.TCPV4.get_dest t in
+      `TCP (Ipaddr.V4 addr,port)
+    in
     let s, _u = Lwt.task () in
+    Lwt.on_cancel s (fun () -> print_endline "Stopping server thread");
     S.listen_tcpv4 t ~port (fun flow ->
-        let f = Flow.create (module S.TCPV4) flow in
+        let f = Flow.create (module S.TCPV4) flow get_dest in
         fn f
       );
     s
@@ -306,19 +325,28 @@ module TLS = struct
   type client = tls_client' [@@deriving sexp]
   type server = tls_server' [@@deriving sexp]
 
+  (* NOTE: this is to avoid infinite recursion when procesessin a value of *)
+  (* type dest. Might it be possible to achieve this with a GADT? *)
+  let get_dest flow =
+    match Flow.get_dest flow with
+    | `TLS _ as tls -> tls
+    | t -> `TLS t
+
   let connect (t:t) (`TLS (c, x): client) =
     connect t x >>= fun flow ->
+    let get_dest _ = get_dest flow in
     TLS.client_of_flow c "??" flow >>= function
     | `Error e -> err_tls "connect" e
     | `Eof     -> err_eof "connect_tls"
-    | `Ok flow -> Lwt.return (Flow.create (module TLS) flow)
+    | `Ok flow -> Lwt.return (Flow.create (module TLS) flow get_dest)
 
   let listen (t:t) (`TLS (c, x): server) fn =
     listen t x (fun flow ->
+        let get_dest _ = get_dest flow in
         TLS.server_of_flow c flow >>= function
         | `Error e -> err_tls "listen" e
         | `Eof     -> err_eof "TLS.server_of_flow"
-        | `Ok flow -> fn (Flow.create (module TLS) flow)
+        | `Ok flow -> fn (Flow.create (module TLS) flow get_dest)
       )
 
 end
